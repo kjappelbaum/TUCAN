@@ -17,7 +17,7 @@ class Molecule
   end
 
   def ninchi_string_permuted_input
-    permuted_molecule_array = update_molecule_indices(@molecule_array, random_indices: true)
+    permuted_molecule_array = update_atom_ids(@molecule_array, true, true)
     write_ninchi_string(canonicalize_molecule(permuted_molecule_array, @name))
   end
 end

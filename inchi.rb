@@ -5,15 +5,16 @@ require './periodic_table'
 class Atom
   include PeriodicTable
   attr_reader :mass, :symbol, :color
-  attr_accessor :id
+  attr_accessor :id, :partition
   attr_writer :edges
 
   def initialize(id, symbol)
     @id = id
     @symbol = symbol
-    @mass = PeriodicTable::ELEMENTS.index(@symbol)
+    @mass = PeriodicTable::ELEMENTS.index(@symbol) + 1
     @color = PeriodicTable::ELEMENT_COLORS[@symbol]
     @edges = []
+    @partition = 0
   end
 
   def edges
@@ -48,23 +49,14 @@ module Inchi
     print_molecule(molecule,
       "\nInitial data structure of #{filename}:")
 
-    sorted_molecule = sort_elements_by_atomic_mass(molecule)
+    sorted_molecule = sort_atoms_by_mass(molecule)
+    update_atom_ids(sorted_molecule) # indices need to be updated in order to be able to index molecule with atom id
     print_molecule(sorted_molecule,
       "\n#{filename} with atoms sorted by atomic mass (increasing):")
 
-    sorted_molecule = sort_elements_by_number_of_edges(sorted_molecule)
-    print_molecule(sorted_molecule,
-      "\n#{filename} with atoms of same kind sorted by number of edges (increasing):")
-
-    sorted_molecule = update_molecule_indices(sorted_molecule)
-    print_molecule(sorted_molecule,
-      "\n#{filename} with updated indices after sorting:")
-
-    *previous_molecule_states, sorted_molecule = sort_elements_by_index_of_edges(sorted_molecule)
-    print_molecule(sorted_molecule,
-      "\n#{filename} with atoms of same kind and same number of edges sorted by indices of edges (increasing):")
-
-    inspect_molecule_states(previous_molecule_states, sorted_molecule, filename)
+    partitioned_molecule = partition_molecule_by_mass(sorted_molecule)
+    print_molecule(partitioned_molecule,
+      "\n#{filename} partitioned by mass:")
 
     sorted_molecule
   end
@@ -130,66 +122,41 @@ module Inchi
     element_counts
   end
 
-  def sort_elements_by_index_of_edges(molecule)
-    # Cannot use built-in sort since indices have to be updated after every swap,
-    # rather than once after sorting is done (like with the other sorting steps).
-    # This is because we sort by indices.
-    n_iterations = molecule.size - 2
-    previous_molecule_states = [Marshal.load(Marshal.dump(molecule))]
-    sorted = false
-    until sorted
+  def mass_edges(molecule, atom)
+    # A Molecule class would be handy.
+    atom.edges.map { |edge| molecule[edge].mass }.sort.reverse
+  end
 
-      for i in 0..n_iterations
-        atom_a = molecule[i]
-        atom_b = molecule[i + 1]
-
-        # Swap A and B (i.e., bubble up A) if ...
-        if (atom_a.mass == atom_b.mass) && # A and B are the same element ...
-          (atom_a.edges.length == atom_b.edges.length) && # with the same number of edges ...
-          (atom_a.edges <=> atom_b.edges) == 1 # and A is connected to larger indices than B.
-          # Spaceship operator (<=>) compares arrays pairwise element-by-element.
-          # I.e., first compare the two elements at index 0, etc.. Result is determined by first unequal element pair.
-          # The operator returns 1 if A > B, -1 if A < B, and 0 if A == B.
-          molecule[i], molecule[i + 1] = molecule[i + 1], molecule[i]
-          molecule = update_molecule_indices(molecule)
-        end
-      end
-      sorted = previous_molecule_states.map { |state| state.map(&:edges) }.include?(molecule.map(&:edges))
-
-      previous_molecule_states.push(Marshal.load(Marshal.dump(molecule)))
+  def partition_molecule_by_mass(molecule)
+    # Mutates molecule.
+    current_partition = molecule[0].partition
+    (0..molecule.size - 2).each do |i|
+      j = i + 1
+      fingerprint_atom_i = [molecule[i].mass] + mass_edges(molecule, molecule[i])
+      fingerprint_atom_j = [molecule[j].mass] + mass_edges(molecule, molecule[j])
+      current_partition += 1 if fingerprint_atom_i != fingerprint_atom_j
+      molecule[j].partition = current_partition
     end
-    previous_molecule_states
+    molecule
   end
 
-  def sort_elements_by_number_of_edges(molecule)
-    # Note that `each_with_index` returns position of atom in molecule array,
-    # not atom ID.
-    molecule.each_with_index.sort { |(atom_a, idx_a), (atom_b, idx_b)|
-      order = 0 # assume unequal masses and hence no swap; note that sort is not stable if order = 0
-      order = atom_a.edges.length <=> atom_b.edges.length if atom_a.mass == atom_b.mass # sort by vertex degree in case of equal masses
-      order = idx_a <=> idx_b if order.zero? # sort by index in case of a) unequal masses or b) equal masses and equal vertex degree; this ensures stable sort
-      order
-    }.map(&:first) # discard index (second element)
+  def sort_atoms_by_mass(molecule)
+    # Mutates molecule.
+    molecule.sort do |atom_a, atom_b|
+      fingerprint_atom_a = [atom_a.mass] + mass_edges(molecule, atom_a)
+      fingerprint_atom_b = [atom_b.mass] + mass_edges(molecule, atom_b)
+      fingerprint_atom_a <=> fingerprint_atom_b
+    end
   end
 
-  def sort_elements_by_atomic_mass(molecule)
-    # Note that `each_with_index` returns position of atom in molecule array,
-    # not atom ID.
-    molecule.each_with_index.sort { |(atom_a, idx_a), (atom_b, idx_b)|
-      order = atom_a.mass <=> atom_b.mass
-      order = idx_a <=> idx_b if order.zero? # sort by index in case of equal masses (i.e., order = 0); this ensures stable sort
-      order
-    }.map(&:first) # discard index (second element)
-  end
-
-  def update_molecule_indices(molecule, random_indices=false)
+  def update_atom_ids(molecule, random_indices=false, update_edges=true)
+    # Mutates molecule.
     index_updates = compute_index_updates(molecule, random_indices)
-    updated_molecule = Marshal.load(Marshal.dump(molecule))
-    updated_molecule.each do |atom|
+    molecule.each do |atom|
       atom.id = index_updates[atom.id]
-      atom.edges.map! { |edge| index_updates[edge] }
+      atom.edges.map! { |edge| index_updates[edge] } if update_edges
     end
-    updated_molecule
+    molecule
   end
 
   def compute_index_updates(molecule, random_indices)
@@ -206,21 +173,26 @@ module Inchi
   end
 
   def print_molecule(molecule, caption)
+
+    pad_width_id = molecule.map { |atom| atom.id.to_s.length }.max
+    pad_width_mass = molecule.map { |atom| atom.mass.to_s.length }.max
+
+    partitions = molecule.map { |atom| atom.partition.to_s }
+    ids_masses = molecule.map { |atom| "(#{atom.id.to_s.ljust(pad_width_id)},#{atom.mass.to_s.rjust(pad_width_mass)})" }
+    edge_ids_masses = molecule.map { |atom| atom.edges.zip(mass_edges(molecule, atom)).map { |id, mass| "(#{id.to_s.ljust(pad_width_id)},#{mass.to_s.rjust(pad_width_mass)})"} }
+    edge_ids_masses.map! { |a| a.size == 1 ? a[0] : a.reduce('') { |s, si| s + "#{si}; " }.delete_suffix('; ') }
+
+    col_headers = ['partition', '(index, mass)', '(index, mass) of connected atoms'.ljust(edge_ids_masses.map(&:length).max)]
     puts caption
-    puts "\nindex\tmass\tindices of connected atoms"
-    puts "-----\t----\t--------------------------"
-    molecule.each { |atom| puts "#{atom.id}\t#{atom.mass + 1}\t#{atom.edges}" }
-  end
-
-  def inspect_molecule_states(previous_states, final_state, filename)
-    puts "\nPrinting all molecule states of #{filename} that occured during sorting by indices of edges..."
-    previous_states.each_with_index do |state, i|
-      print_molecule(state,
-        "\nIteration #{i} yielded the following state:")
+    puts
+    puts col_headers.reduce('|') { |header, col| header + " #{col} |" }
+    puts
+    (0..molecule.size - 1).each do |i|
+      line = '|'
+      line += " #{partitions[i].ljust(col_headers[0].length)} |"
+      line += " #{ids_masses[i].ljust(col_headers[1].length)} |"
+      line += " #{edge_ids_masses[i].ljust(col_headers[2].length)} |"
+      puts line
     end
-    r = previous_states.map { |state| state.map(&:edges) }.index(final_state.map(&:edges))
-    print_molecule(final_state,
-      "\nSorting converged in iteration #{previous_states.size} with re-occurence of state at iteration #{r}:")
   end
-
 end
