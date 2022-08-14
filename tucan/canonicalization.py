@@ -1,7 +1,8 @@
 from tucan.graph_utils import sort_molecule_by_attribute, attribute_sequence
 import networkx as nx
-from igraph import Graph as iGraph
 from itertools import pairwise
+from operator import gt, lt, eq
+from collections import deque
 
 
 def partition_molecule_by_attribute(m, attribute):
@@ -39,29 +40,46 @@ def refine_partitions(m):
         )
 
 
-def assign_canonical_labels(m):
-    """Canonicalize node-labels of a graph.
-
-    The canonical labels are computed using the igraph [1] implementation of
-    the "bliss" algorithm [2].
-
-    Returns
-    -------
-    dict
-        From old labels (keys) to canonical labels (values).
-
-    References
-    ----------
-    [1] https://igraph.org
-    [2] https://doi.org/10.1137/1.9781611972870.13
+def assign_canonical_labels(m, traversal_priorities=[lt, gt, eq]):
+    """Re-label nodes such that each node is connected to neighbors with the
+    smallest possible labels.
     """
+    partitions = m.nodes.data("partition")
+    labels_by_partition = _labels_by_partition(m)
+    final_labels = {}
+    atom_queue = deque([0])
+    nx.set_node_attributes(m, False, "explored")
 
-    m_igraph = iGraph.from_networkx(m)
-    old_labels = m_igraph.vs["_nx_name"]
-    partitions = m_igraph.vs["partition"]
-    canonical_labels = m_igraph.canonical_permutation(color=partitions)
+    while atom_queue:
+        a = atom_queue.popleft()
+        if m.nodes[a]["explored"]:
+            continue
 
-    return dict(zip(old_labels, canonical_labels))
+        # assign smallest label available in this partition
+        final_labels[a] = labels_by_partition[partitions[a]].pop()
+        m.nodes[a]["explored"] = True
+
+        neighbors = list(m.neighbors(a))
+        for priority in traversal_priorities:
+            atom_queue.extend(
+                [n for n in neighbors if priority(partitions[a], partitions[n])]
+            )
+
+    nx.set_node_attributes(m, False, "explored")
+
+    return final_labels
+
+
+def _labels_by_partition(m):
+    """Create dictionary of partitions to node labels."""
+    partitions = set(sorted([v for _, v in m.nodes.data("partition")]))
+    labels_by_partition = {p: set() for p in partitions}
+    for a in m:
+        labels_by_partition[m.nodes[a]["partition"]].add(a)
+    labels_by_partition.update(
+        (k, sorted(list(v), reverse=True)) for k, v in labels_by_partition.items()
+    )
+    return labels_by_partition
 
 
 def _add_invariant_code(m):
